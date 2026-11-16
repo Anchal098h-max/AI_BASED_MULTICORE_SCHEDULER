@@ -1,0 +1,300 @@
+import re
+import time
+from pathlib import Path
+
+import joblib
+import numpy as np
+import psutil
+import torch
+import torch.nn as nn
+
+
+MODEL_PATH = Path("cpu_lstm_model.pth")
+X_SCALER_PATH = Path("cpu_feature_scaler.pkl")
+Y_SCALER_PATH = Path("cpu_target_scaler.pkl")
+
+N_CPUS = 16
+WINDOW_SIZE = 20
+POLL_SECONDS = 1.0
+
+QUEUE_FILES = (
+    Path("/sys/kernel/debug/sched/debug"),
+    Path("/proc/sched_debug"),
+)
+
+
+class CpuUtilizationLSTM(nn.Module):
+    def __init__(
+        self,
+        input_size=35,
+        hidden1=128,
+        hidden2=64,
+        output_size=16,
+        dropout=0,
+    ):
+        super().__init__()
+        self.lstm1 = nn.LSTM(input_size, hidden1, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+        self.lstm2 = nn.LSTM(hidden1, hidden2, batch_first=True)
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden2, output_size)
+
+    def forward(self, x):
+        out, _ = self.lstm1(x)
+        out = self.dropout1(out)
+        out, _ = self.lstm2(out)
+        out = self.dropout2(out)
+        return self.fc(out[:, -1, :])
+
+
+class ProcessQueueTracker:
+    """Maintains the running queue and ready queue of programs, per CPU.
+
+    On Linux a process in state 'R' is either executing on a CPU (running) or
+    waiting on that CPU's run queue for its turn (ready). User space cannot
+    see directly which one it is, so this tracker approximates it: on each
+    CPU, the 'R' process that consumed the most CPU time since the previous
+    sample is treated as running, and the other 'R' processes on that CPU
+    are treated as ready (waiting).
+
+    running_queue[cpu] -> list of at most one process entry
+    ready_queue[cpu]   -> list of waiting process entries, longest-running first
+    Each entry is a dict: {"pid": int, "name": str, "cpu_delta": float}
+    """
+
+    def __init__(self, n_cpus):
+        self.n_cpus = n_cpus
+        self.prev_cpu_times = {}
+        self.running_queue = {cpu: [] for cpu in range(n_cpus)}
+        self.ready_queue = {cpu: [] for cpu in range(n_cpus)}
+        self.process_count = 0
+
+    def update(self):
+        per_cpu = {cpu: [] for cpu in range(self.n_cpus)}
+        new_cpu_times = {}
+        process_count = 0
+
+        attrs = ["pid", "name", "status", "cpu_num", "cpu_times"]
+        for proc in psutil.process_iter(attrs):
+            try:
+                info = proc.info
+                process_count += 1
+
+                pid = info["pid"]
+                times = info.get("cpu_times")
+                cpu_time = (times.user + times.system) if times else 0.0
+                new_cpu_times[pid] = cpu_time
+
+                if info.get("status") != psutil.STATUS_RUNNING:
+                    continue
+
+                cpu = info.get("cpu_num")
+                if cpu is None or cpu not in per_cpu:
+                    continue
+
+                delta = cpu_time - self.prev_cpu_times.get(pid, cpu_time)
+                per_cpu[cpu].append(
+                    {
+                        "pid": pid,
+                        "name": info.get("name") or "?",
+                        "cpu_delta": round(delta, 3),
+                    }
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # The process may exit or become inaccessible during collection.
+                continue
+
+        running_queue = {}
+        ready_queue = {}
+        for cpu, entries in per_cpu.items():
+            entries.sort(key=lambda e: e["cpu_delta"], reverse=True)
+            running_queue[cpu] = entries[:1]
+            ready_queue[cpu] = entries[1:]
+
+        self.prev_cpu_times = new_cpu_times
+        self.running_queue = running_queue
+        self.ready_queue = ready_queue
+        self.process_count = process_count
+
+    @property
+    def running_count(self):
+        return sum(len(q) for q in self.running_queue.values())
+
+    @property
+    def ready_count(self):
+        return sum(len(q) for q in self.ready_queue.values())
+
+    def snapshot(self):
+        """Copy of the current queues, safe to store in a history list."""
+        return {
+            "running": {c: list(q) for c, q in self.running_queue.items()},
+            "ready": {c: list(q) for c, q in self.ready_queue.items()},
+        }
+
+    def format_queues(self):
+        lines = []
+        for cpu in range(self.n_cpus):
+            running = self.running_queue[cpu]
+            ready = self.ready_queue[cpu]
+            if not running and not ready:
+                continue
+            run_txt = (
+                f"{running[0]['name']}({running[0]['pid']})" if running else "-"
+            )
+            ready_txt = ", ".join(f"{p['name']}({p['pid']})" for p in ready) or "-"
+            lines.append(f"  CPU {cpu:2d} | running: {run_txt} | ready: [{ready_txt}]")
+        header = (
+            f"  Running queue: {self.running_count} | "
+            f"Ready queue: {self.ready_count}"
+        )
+        return "\n".join([header] + lines)
+
+
+def read_per_cpu_queues():
+    sched_file = next((path for path in QUEUE_FILES if path.is_file()), None)
+
+    if sched_file is None:
+        raise RuntimeError(
+            "Linux scheduler queue data is unavailable. Check debugfs access."
+        )
+
+    queues = {}
+    current_cpu = None
+
+    try:
+        lines = sched_file.read_text(errors="replace").splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read scheduler data at {sched_file}.") from exc
+
+    for line in lines:
+        cpu_match = re.match(r"\s*cpu#(\d+)", line)
+        if cpu_match:
+            current_cpu = int(cpu_match.group(1))
+            continue
+
+        count_match = re.search(r"\bnr_running\s*:\s*(\d+)", line)
+        if count_match and current_cpu is not None:
+            queues[current_cpu] = int(count_match.group(1))
+
+    missing = [cpu for cpu in range(N_CPUS) if cpu not in queues]
+    if missing:
+        raise RuntimeError(f"Scheduler queue readings are missing for CPUs {missing}.")
+
+    return [queues[cpu] for cpu in range(N_CPUS)]
+
+
+def collect_features(tracker):
+    # Wait for a real one-second CPU sample.
+    cpu_util = psutil.cpu_percent(interval=POLL_SECONDS, percpu=True)
+
+    if len(cpu_util) != N_CPUS:
+        raise RuntimeError(
+            f"Model expects {N_CPUS} logical CPUs; device reports {len(cpu_util)}."
+        )
+
+    overall_cpu = float(np.mean(cpu_util))
+
+    # Refresh the running/ready queues and the process counts in one pass.
+    tracker.update()
+    process_count = tracker.process_count
+    running_processes = tracker.running_count + tracker.ready_count
+
+    queues = read_per_cpu_queues()
+
+    # Feature order must match the training notebook:
+    # CPU utilizations 0..15, queue lengths 0..15, then the three system metrics.
+    # (Unchanged: the model still receives the same 35 inputs.)
+    features = np.array(
+        list(cpu_util)
+        + queues
+        + [process_count, running_processes, overall_cpu],
+        dtype=np.float32,
+    )
+
+    if features.shape != (35,) or not np.isfinite(features).all():
+        raise RuntimeError("Collected live features are incomplete or invalid.")
+
+    return features
+
+
+def main():
+    for path in (MODEL_PATH, X_SCALER_PATH, Y_SCALER_PATH):
+        if not path.is_file():
+            raise FileNotFoundError(f"Required file not found: {path.resolve()}")
+
+    cpu_count = psutil.cpu_count(logical=True)
+    if cpu_count != N_CPUS:
+        raise RuntimeError(
+            f"Model expects {N_CPUS} logical CPUs; device reports {cpu_count}."
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x_scaler = joblib.load(X_SCALER_PATH)
+    y_scaler = joblib.load(Y_SCALER_PATH)
+
+    if getattr(x_scaler, "n_features_in_", None) != 35:
+        raise RuntimeError("Feature scaler does not match the model's 35 inputs.")
+    if getattr(y_scaler, "n_features_in_", None) != 16:
+        raise RuntimeError("Target scaler does not match the model's 16 outputs.")
+
+    model = CpuUtilizationLSTM().to(device)
+    try:
+        state = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+    except TypeError:
+        # Compatibility with older PyTorch versions.
+        state = torch.load(MODEL_PATH, map_location=device)
+
+    model.load_state_dict(state)
+    model.eval()
+
+    process = psutil.Process()
+    tracker = ProcessQueueTracker(N_CPUS)
+    history = []
+    queue_history = []  # running/ready queue snapshots, aligned with `history`
+    print("Collecting live data. The first prediction will appear after 20 samples.")
+
+    while True:
+        history.append(collect_features(tracker))
+        queue_history.append(tracker.snapshot())
+        history = history[-WINDOW_SIZE:]
+        queue_history = queue_history[-WINDOW_SIZE:]
+
+        if len(history) == WINDOW_SIZE:
+            batch = np.stack(history)
+            scaled_batch = x_scaler.transform(batch)
+
+            model_input = torch.tensor(
+                scaled_batch[np.newaxis, :, :],
+                dtype=torch.float32,
+                device=device,
+            )
+
+            with torch.no_grad():
+                prediction_scaled = model(model_input).cpu().numpy()
+
+            prediction = y_scaler.inverse_transform(prediction_scaled)[0]
+            # cpu_num() reports the logical CPU on which this process most
+            # recently ran. The process can migrate, so this is a point-in-time
+            # reading taken immediately before printing each prediction.
+            try:
+                running_core = process.cpu_num()
+                core_label = f"Logical CPU core: {running_core}"
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                core_label = "Logical CPU core: unavailable"
+
+            print(
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                core_label,
+                "Predicted CPU utilization:",
+                np.round(prediction, 2).tolist(),
+            )
+            print(tracker.format_queues())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except Exception as exc:
+        print(f"Could not start prediction: {exc}")
